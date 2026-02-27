@@ -1,0 +1,32 @@
+{
+  "notify_private_ids": {
+    "description": "私聊提醒目标（QQ号列表）",
+    "type": "list",
+    "hint": "填入需要接收生日提醒的 QQ 号，插件会自动识别当前运行的平台。例如填入 123456789，无需写 aiocqhttp:PrivateMessage:xxx 这种格式。",
+    "default": []
+  },
+  "notify_group_ids": {
+    "description": "群聊提醒目标（群号列表）",
+    "type": "list",
+    "hint": "填入需要接收生日提醒的群号，插件会自动识别当前运行的平台。例如填入 987654321，无需写完整 SID。",
+    "default": []
+  },
+  "advance_days": {
+    "description": "提前提醒天数",
+    "type": "int",
+    "hint": "在生日前几天发送提醒。例如填 2 表示提前 2 天提醒，填 0 则仅在当天提醒。",
+    "default": 2
+  },
+  "check_time": {
+    "description": "每日检查时间",
+    "type": "string",
+    "hint": "24小时制，格式为 H:MM 或 HH:MM，例如：8:00、13:30，注意使用英文冒号。",
+    "default": "8:00"
+  },
+  "friends_birthday": {
+    "description": "好友生日数据（可手动增删改）",
+    "type": "list",
+    "hint": "存储好友生日信息。使用 /生日刷新 指令可从 QQ 自动填充。每条记录为 JSON 对象，字段说明：\nqq：QQ号（字符串）\nnickname：备注/昵称\nbirthday_year：出生年份（可为 null）\nbirthday_month：出生月份（1~12）\nbirthday_day：出生日（1~31）\n示例：{\"qq\": \"123456\", \"nickname\": \"张三\", \"birthday_year\": null, \"birthday_month\": 3, \"birthday_day\": 15}",
+    "default": []
+  }
+}
