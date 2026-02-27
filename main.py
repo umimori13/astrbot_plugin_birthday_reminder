@@ -1,7 +1,11 @@
 import asyncio
 import datetime
 import json
+import time
+import zoneinfo
 
+import aiofiles
+import aiofiles.os as aio_os
 import croniter
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -18,6 +22,8 @@ _FETCH_CONCURRENCY: int = 5
 _FETCH_DELAY: float = 0.3
 # 单条请求失败后的重试等待序列（秒）：第1次失败等300s，第2次失败等1800s
 _FETCH_RETRY_WAITS: tuple[float, ...] = (300, 1800)
+# 高成本指令（刷新/检查）的触发冷却时间（秒），防止频繁调用
+_CMD_COOLDOWN: float = 60.0
 
 
 class FriendBirthdayPlugin(Star):
@@ -35,7 +41,14 @@ class FriendBirthdayPlugin(Star):
             str(x) for x in self.config.get("notify_group_ids", [])
         ]
         # 提前几天发送提醒（0 表示仅当天提醒）
-        self.advance_days: int = int(self.config.get("advance_days", 2))
+        try:
+            self.advance_days: int = int(self.config.get("advance_days", 2))
+        except (ValueError, TypeError):
+            logger.warning(
+                f"[FriendBirthday] advance_days 配置值 "
+                f"'{self.config.get('advance_days')}' 无效，使用默认值 2。"
+            )
+            self.advance_days = 2
         # 每天检查的时间，24h 格式，例如 "8:00"
         self.check_time: str = self.config.get("check_time", "8:00")
 
@@ -49,8 +62,41 @@ class FriendBirthdayPlugin(Star):
         self._daily_task: asyncio.Task | None = None
         # 托管所有后台任务，确保插件卸载时能统一回收
         self._bg_tasks: set[asyncio.Task] = set()
+        # 高成本指令的上次触发时间戳，用于冷却控制
+        self._last_cmd_time: float = 0.0
+        # 文件写入锁（在 initialize 中创建，asyncio.Lock 必须在事件循环内创建）
+        self._data_lock: asyncio.Lock | None = None
+        # 时区（从 AstrBot 全局配置读取，用于定时任务调度）
+        self._timezone: zoneinfo.ZoneInfo | None = None
 
     async def initialize(self):
+        self._data_lock = asyncio.Lock()
+
+        # 加载时区配置，确保定时任务调度时间与用户时区一致
+        try:
+            self._timezone = zoneinfo.ZoneInfo(self.context.get_config().get("timezone"))
+        except (zoneinfo.ZoneInfoNotFoundError, TypeError, KeyError, ValueError) as e:
+            logger.warning(
+                f"[FriendBirthday] 时区配置无效或未配置 ({e})，将使用服务器系统时区。"
+            )
+            self._timezone = None
+
+        # 若内存配置为空，尝试从 JSON 文件回灌数据（兼容手动编辑 JSON 的场景）
+        if self._need_initial_fetch and await aio_os.path.exists(self._config_file):
+            try:
+                async with aiofiles.open(self._config_file, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                file_data = await asyncio.to_thread(json.loads, content)
+                saved: list = file_data.get("friends_birthday", [])
+                if saved:
+                    self.config["friends_birthday"] = saved
+                    self._need_initial_fetch = False
+                    logger.info(
+                        f"[FriendBirthday] 从 JSON 文件回灌 {len(saved)} 条生日数据至配置。"
+                    )
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"[FriendBirthday] 读取 JSON 文件失败，将重新拉取: {e}")
+
         if self._need_initial_fetch:
             logger.info(
                 "[FriendBirthday] 配置中暂无好友生日数据，"
@@ -111,7 +157,7 @@ class FriendBirthdayPlugin(Star):
         for attempt in range(1 + len(_FETCH_RETRY_WAITS)):
             last_exc: Exception | None = None
 
-            # 信号量仅包裹实际网络请求 + 节流间隔，绝不在此持锁等待重试
+            # 信号量仅包裹实际网络请求，绝不在持锁期间等待重试或节流
             async with sem:
                 try:
                     info: dict = await bot.get_stranger_info(user_id=int(qq), no_cache=True)
@@ -120,9 +166,8 @@ class FriendBirthdayPlugin(Star):
                     bday_day = info.get("birthday_day")
                 except Exception as e:
                     last_exc = e
-                finally:
-                    # 无论成功/失败，释放信号量前先等节流间隔
-                    await asyncio.sleep(_FETCH_DELAY)
+            # 节流间隔在信号量外执行，释放槽后再等待，不影响其他协程获取槽
+            await asyncio.sleep(_FETCH_DELAY)
 
             if last_exc is None:
                 break  # 请求成功，退出重试循环
@@ -167,10 +212,10 @@ class FriendBirthdayPlugin(Star):
                 )
                 friends_data: list[dict] = [
                     r for r in raw_results
-                    if isinstance(r, dict) and r is not None
+                    if isinstance(r, dict)
                 ]
 
-                self._save_data(friends_data)
+                await self._save_data(friends_data)
                 # 仅在成功保存后置 False，失败时保留自动重试能力
                 self._need_initial_fetch = False
                 valid = sum(
@@ -194,31 +239,35 @@ class FriendBirthdayPlugin(Star):
     def _resolve_full_umo(self, target_id: str, msg_type: str) -> str:
         """
         动态推算完整的 UMO (Unified Message Origin)。
-        从当前正在运行的平台实例中选取首个健康实例拼装 SID，
-        避免用户手动填写 aiocqhttp:PrivateMessage:xxx 这种格式。
+        仅在 AIOCQHTTP 平台实例中选取，避免多平台场景下误发到其他平台。
         """
-        active_insts = {
-            p.meta().id: p
-            for p in self.context.platform_manager.get_insts()
-            if p.meta().id and "webchat" not in p.meta().id.lower()
-        }
-
-        # 优先选取运行中的平台
-        running = [
-            p for p in active_insts.values() if p.status == PlatformStatus.RUNNING
+        # 仅选取 AIOCQHTTP 实例，防止多平台环境下消息误投其他账号/租户
+        cqhttp_insts = [
+            p for p in self.context.platform_manager.get_insts()
+            if p.meta().id
+            and "aiocqhttp" in p.meta().id.lower()
+            and "webchat" not in p.meta().id.lower()
         ]
+
+        running = [p for p in cqhttp_insts if p.status == PlatformStatus.RUNNING]
         if running:
             if len(running) > 1:
                 logger.warning(
-                    f"[FriendBirthday] 检测到 {len(running)} 个运行中的平台实例，"
+                    f"[FriendBirthday] 检测到 {len(running)} 个运行中的 AIOCQHTTP 实例，"
                     f"将使用首个实例（{running[0].meta().id}）发送消息。"
-                    "多平台场景下建议在配置中通过完整 SID 精确指定目标。"
+                    "多实例场景下建议在配置中通过完整 SID 精确指定目标。"
                 )
             return f"{running[0].meta().id}:{msg_type}:{target_id}"
 
-        # 保底：取第一个已知平台或 default
-        fallback = list(active_insts.keys())[0] if active_insts else "default"
+        # 保底：取第一个已知 AIOCQHTTP 实例或 default
+        fallback = cqhttp_insts[0].meta().id if cqhttp_insts else "default"
         return f"{fallback}:{msg_type}:{target_id}"
+
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        """检查发送者是否在 AstrBot 管理员列表中。"""
+        sender_id = str(event.get_sender_id())
+        admin_ids = [str(x) for x in self.context.config.get("admins_id", [])]
+        return sender_id in admin_ids
 
     # ------------------------------------------------------------------
     # 数据读写
@@ -228,26 +277,31 @@ class FriendBirthdayPlugin(Star):
         """从插件配置中读取好友生日列表。"""
         return list(self.config.get("friends_birthday", []))
 
-    def _save_data(self, data: list[dict]) -> None:
-        """将好友生日列表写回插件配置并持久化到磁盘。"""
-        # 先持久化到磁盘，成功后再更新内存，避免不一致
-        try:
-            existing: dict = {}
-            if self._config_file.exists():
-                try:
-                    with open(self._config_file, "r", encoding="utf-8") as f:
-                        existing = json.load(f)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"[FriendBirthday] 配置文件 JSON 解析失败，将覆盖写入: {e}")
-            existing["friends_birthday"] = data
-            self._config_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(existing, f, ensure_ascii=False, indent=4)
-        except OSError as e:
-            logger.error(f"[FriendBirthday] 写入配置文件失败: {e}")
-            return
-        # 磁盘写入成功，更新内存中的配置
-        self.config["friends_birthday"] = data
+    async def _save_data(self, data: list[dict]) -> None:
+        """将好友生日列表异步写回插件配置并持久化到磁盘（带锁，防并发写冲突）。"""
+        async with self._data_lock:
+            # 先持久化到磁盘，成功后再更新内存，避免不一致
+            try:
+                existing: dict = {}
+                if await aio_os.path.exists(self._config_file):
+                    try:
+                        async with aiofiles.open(self._config_file, "r", encoding="utf-8") as f:
+                            content = await f.read()
+                        existing = await asyncio.to_thread(json.loads, content)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"[FriendBirthday] 配置文件 JSON 解析失败，将覆盖写入: {e}")
+                existing["friends_birthday"] = data
+                await aio_os.makedirs(self._config_file.parent, exist_ok=True)
+                serialized = await asyncio.to_thread(
+                    json.dumps, existing, ensure_ascii=False, indent=4
+                )
+                async with aiofiles.open(self._config_file, "w", encoding="utf-8") as f:
+                    await f.write(serialized)
+            except OSError as e:
+                logger.error(f"[FriendBirthday] 写入配置文件失败: {e}")
+                return
+            # 磁盘写入成功，更新内存中的配置
+            self.config["friends_birthday"] = data
 
     # ------------------------------------------------------------------
     # 生日查询逻辑
@@ -279,14 +333,20 @@ class FriendBirthdayPlugin(Star):
                 continue
         return result
 
+    def _today(self) -> datetime.date:
+        """返回当前时区下的今天日期，与定时任务调度时区保持一致。"""
+        if self._timezone:
+            return datetime.datetime.now(self._timezone).date()
+        return datetime.date.today()
+
     def _today_birthdays(self, data: list[dict] | None = None) -> list[dict]:
-        return self._birthdays_on(datetime.date.today(), data=data)
+        return self._birthdays_on(self._today(), data=data)
 
     def _advance_birthdays(self, data: list[dict] | None = None) -> list[dict]:
         """返回 advance_days 天后生日的好友列表。"""
         if self.advance_days <= 0:
             return []
-        target = datetime.date.today() + datetime.timedelta(days=self.advance_days)
+        target = self._today() + datetime.timedelta(days=self.advance_days)
         return self._birthdays_on(target, data=data)
 
     # ------------------------------------------------------------------
@@ -296,10 +356,12 @@ class FriendBirthdayPlugin(Star):
     async def _send_reminder(
         self, friends: list[dict], days_ahead: int
     ) -> tuple[int, int]:
-        """向所有配置的目标（私聊 + 群聊）发送生日提醒。
+        """向所有配置的目标（私聊 + 群聊）发送聚合生日提醒。
+
+        所有好友合并为单条消息发送，避免好友数量多时造成消息洪泛。
 
         Returns:
-            (sent, failed): 实际投递成功条数与失败条数。
+            (sent, failed): 实际投递成功条数与失败条数（按目标数计）。
         """
         all_targets = [
             (uid, "FriendMessage") for uid in self.notify_private_ids
@@ -309,47 +371,52 @@ class FriendBirthdayPlugin(Star):
         if not friends or not all_targets:
             return 0, 0
 
+        # 聚合所有好友信息为单条消息，每个目标只收到一条提醒
+        friend_lines = [
+            f"• {f.get('nickname') or f.get('qq')}（QQ: {f.get('qq')}）"
+            for f in friends
+        ]
+        if days_ahead == 0:
+            text = "🎂 今日好友生日提醒\n" + "\n".join(friend_lines) + "\n\n记得送上祝福哦！🎉"
+        else:
+            advance_date = self._today() + datetime.timedelta(days=days_ahead)
+            date_str = advance_date.strftime("%m月%d日")
+            text = (
+                f"🔔 生日提醒：以下好友将在 {days_ahead} 天后（{date_str}）过生日\n"
+                + "\n".join(friend_lines)
+                + "\n\n别忘了送上祝福！"
+            )
+
         sent, failed = 0, 0
-        for friend in friends:
-            name = friend.get("nickname") or friend.get("qq")
-            qq = friend.get("qq")
-            bday_month = friend.get("birthday_month")
-            bday_day = friend.get("birthday_day")
-            try:
-                date_str = (
-                    f"{int(bday_month):02d}月{int(bday_day):02d}日"
-                    if bday_month and bday_day
-                    else "未知日期"
-                )
-            except (ValueError, TypeError):
-                date_str = "未知日期"
-
-            if days_ahead == 0:
-                text = (
-                    f"🎂 今天是 {name}（QQ: {qq}）的生日！\n"
-                    f"记得送上祝福哦！🎉"
-                )
-            else:
-                text = (
-                    f"🔔 生日提醒：{name}（QQ: {qq}）\n"
-                    f"将在 {days_ahead} 天后（{date_str}）过生日，\n"
-                    f"别忘了送上祝福！"
-                )
-
-            for raw_id, msg_type in all_targets:
-                session_id = self._resolve_full_umo(raw_id, msg_type)
-                try:
-                    chain = MessageChain().message(text)
-                    await self.context.send_message(session_id, chain)
-                    logger.info(
-                        f"[FriendBirthday] 已向 {session_id} 发送提醒: {name}（{qq}）"
-                    )
-                    sent += 1
-                except Exception as e:
-                    logger.error(
-                        f"[FriendBirthday] 向 {session_id} 发送提醒失败: {e}"
+        for raw_id, msg_type in all_targets:
+            session_id = self._resolve_full_umo(raw_id, msg_type)
+            # 发送前验证平台是否仍在运行，防止平台断连时引发异常
+            parts = session_id.split(":", 2)
+            if len(parts) == 3:
+                p_id = parts[0]
+                insts = {
+                    p.meta().id: p
+                    for p in self.context.platform_manager.get_insts()
+                    if p.meta().id
+                }
+                platform_inst = insts.get(p_id)
+                if not platform_inst or platform_inst.status != PlatformStatus.RUNNING:
+                    logger.warning(
+                        f"[FriendBirthday] 平台 {p_id} 不存在或未运行，跳过发送至 {session_id}"
                     )
                     failed += 1
+                    continue
+            try:
+                chain = MessageChain().message(text)
+                await self.context.send_message(session_id, chain)
+                logger.info(
+                    f"[FriendBirthday] 已向 {session_id} 发送提醒"
+                    f"（{len(friends)} 位好友，{'今日' if days_ahead == 0 else f'{days_ahead}天后'}）"
+                )
+                sent += 1
+            except Exception as e:
+                logger.error(f"[FriendBirthday] 向 {session_id} 发送提醒失败: {e}")
+                failed += 1
         return sent, failed
 
     # ------------------------------------------------------------------
@@ -369,12 +436,14 @@ class FriendBirthdayPlugin(Star):
             hour, minute = 8, 0
 
         cron_expr = f"{minute} {hour} * * *"
-        cron = croniter.croniter(cron_expr, datetime.datetime.now())
+        _now = datetime.datetime.now(self._timezone) if self._timezone else datetime.datetime.now()
+        cron = croniter.croniter(cron_expr, _now)
 
         while True:
             try:
                 next_run = cron.get_next(datetime.datetime)
-                now = datetime.datetime.now()
+                now = datetime.datetime.now(self._timezone) if self._timezone else datetime.datetime.now()
+                # next_run 来自 croniter，与 now 同为带时区或同为无时区，可直接相减
                 sleep_sec = (next_run - now).total_seconds()
                 logger.info(
                     f"[FriendBirthday] 下次生日检查时间: {next_run}，"
@@ -389,6 +458,9 @@ class FriendBirthdayPlugin(Star):
             except Exception as e:
                 logger.error(f"[FriendBirthday] 每日任务出错: {e}")
                 await asyncio.sleep(300)
+                # 重新初始化 croniter，避免因状态已推进而跳过当天的检查
+                _now = datetime.datetime.now(self._timezone) if self._timezone else datetime.datetime.now()
+                cron = croniter.croniter(cron_expr, _now)
 
     async def _run_birthday_check(self) -> tuple[int, int]:
         """执行一次完整的生日检查（当天 + 提前 N 天）并发送提醒。
@@ -420,7 +492,17 @@ class FriendBirthdayPlugin(Star):
 
     @filter.command("生日刷新")
     async def cmd_refresh(self, event: AstrMessageEvent):
-        """重新从 QQ 拉取所有好友的生日信息并更新本地 JSON"""
+        """重新从 QQ 拉取所有好友的生日信息并更新本地 JSON（仅管理员）"""
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 该指令仅管理员可用。")
+            return
+
+        now = time.monotonic()
+        remaining = _CMD_COOLDOWN - (now - self._last_cmd_time)
+        if remaining > 0:
+            yield event.plain_result(f"⏱️ 冷却中，请 {remaining:.0f}s 后再试。")
+            return
+
         if self._fetching:
             yield event.plain_result("⏳ 正在获取中，请稍候...")
             return
@@ -433,6 +515,7 @@ class FriendBirthdayPlugin(Star):
             )
             return
 
+        self._last_cmd_time = now
         self._fetching = True
         self._spawn_task(self.fetch_friends_birthday(bot))
         yield event.plain_result(
@@ -450,21 +533,18 @@ class FriendBirthdayPlugin(Star):
             )
             return
 
-        today = datetime.date.today()
+        today = self._today()
         lines: list[str] = []
 
-        # 一次加载，复用数据
-        cached_data = data
-
         # 今天生日
-        today_list = self._birthdays_on(today, data=cached_data)
+        today_list = self._birthdays_on(today, data=data)
         for f in today_list:
             lines.append(f"🎂 今天：{f.get('nickname')}（{f.get('qq')}）")
 
         # 未来 7 天
         for days in range(1, 8):
             target = today + datetime.timedelta(days=days)
-            for f in self._birthdays_on(target, data=cached_data):
+            for f in self._birthdays_on(target, data=data):
                 lines.append(
                     f"📅 {target.strftime('%m/%d')}（{days}天后）："
                     f"{f.get('nickname')}（{f.get('qq')}）"
@@ -477,7 +557,18 @@ class FriendBirthdayPlugin(Star):
 
     @filter.command("生日检查")
     async def cmd_check(self, event: AstrMessageEvent):
-        """立即执行一次生日检查，并向配置的目标发送提醒"""
+        """立即执行一次生日检查，并向配置的目标发送提醒（仅管理员）"""
+        if not self._is_admin(event):
+            yield event.plain_result("❌ 该指令仅管理员可用。")
+            return
+
+        now = time.monotonic()
+        remaining = _CMD_COOLDOWN - (now - self._last_cmd_time)
+        if remaining > 0:
+            yield event.plain_result(f"⏱️ 冷却中，请 {remaining:.0f}s 后再试。")
+            return
+
+        self._last_cmd_time = now
         today_list = self._today_birthdays()
         advance_list = self._advance_birthdays()
 
@@ -486,7 +577,6 @@ class FriendBirthdayPlugin(Star):
                 f"✅ 检查完成：今天及 {self.advance_days} 天后均无好友生日。"
             )
             return
-
         sent, failed = await self._run_birthday_check()
         result_msg = f"✅ 检查完成，共投递 {sent} 条生日提醒"
         if failed:
@@ -526,7 +616,7 @@ class FriendBirthdayPlugin(Star):
             self._daily_task.cancel()
             try:
                 await self._daily_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
         # 取消所有托管的后台抓取任务
