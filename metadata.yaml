@@ -1,6 +1,6 @@
 name: astrbot_plugin_birthday_reminder
 display_name: QQ好友生日提醒
 desc: 提取当前QQ好友的生日，然后每日检查后提前几日向指定群或好友发送提醒消息
-version: v1.0.0
+version: v1.0.1
 author: 莫里
 repo: https://github.com/umimori13/astrbot_plugin_birthday_reminder

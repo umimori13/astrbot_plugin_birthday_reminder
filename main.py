@@ -6,7 +6,7 @@ import os
 import croniter
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.platform import PlatformStatus
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import \
@@ -14,12 +14,6 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import \
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 
 
-@register(
-    "astrbot_plugin_friend_birthday",
-    "Author",
-    "QQ好友生日提醒：自动获取好友生日并定时提醒",
-    "1.0.0",
-)
 class FriendBirthdayPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -40,9 +34,7 @@ class FriendBirthdayPlugin(Star):
         self.check_time: str = self.config.get("check_time", "8:00")
 
         # AstrBot 插件配置文件路径（用于持久化写回）
-        self._config_file = os.path.join(
-            "data", "config", "astrbot_plugin_friend_birthday.json"
-        )
+        self._config_file = StarTools.get_data_dir() / "friends_birthday.json"
 
         # ---------- 内部状态 ----------
         self._fetch_lock = asyncio.Lock()
@@ -185,13 +177,16 @@ class FriendBirthdayPlugin(Star):
         try:
             existing: dict = {}
             if os.path.exists(self._config_file):
-                with open(self._config_file, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
+                try:
+                    with open(self._config_file, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"[FriendBirthday] 配置文件 JSON 解析失败，将覆盖写入: {e}")
             existing["friends_birthday"] = data
-            os.makedirs(os.path.dirname(self._config_file), exist_ok=True)
+            self._config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=4)
-        except Exception as e:
+        except OSError as e:
             logger.error(f"[FriendBirthday] 写入配置文件失败: {e}")
 
     # ------------------------------------------------------------------
@@ -299,7 +294,7 @@ class FriendBirthdayPlugin(Star):
                     f"[FriendBirthday] 下次生日检查时间: {next_run}，"
                     f"等待 {sleep_sec:.0f} 秒"
                 )
-                await asyncio.sleep(sleep_sec)
+                await asyncio.sleep(max(0, sleep_sec))
                 await self._run_birthday_check()
                 # 等待 60 秒防止在同一分钟内重复触发
                 await asyncio.sleep(60)
