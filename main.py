@@ -12,6 +12,13 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import \
     AiocqhttpMessageEvent
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 
+# 并发拉取参数：同时进行的最大请求数
+_FETCH_CONCURRENCY: int = 5
+# 每条请求完成后的最小间隔（秒），避免服务端频繁接口返回 null
+_FETCH_DELAY: float = 0.3
+# 单条请求失败后的重试等待序列（秒）：第1次失败等300s，第2次失败等1800s
+_FETCH_RETRY_WAITS: tuple[float, ...] = (300, 1800)
+
 
 class FriendBirthdayPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -40,11 +47,13 @@ class FriendBirthdayPlugin(Star):
         self._need_initial_fetch: bool = len(self.config.get("friends_birthday", [])) == 0
         self._fetching: bool = False
         self._daily_task: asyncio.Task | None = None
+        # 托管所有后台任务，确保插件卸载时能统一回收
+        self._bg_tasks: set[asyncio.Task] = set()
 
     async def initialize(self):
         if self._need_initial_fetch:
             logger.info(
-                "[FriendBirthday] 好友生日数据文件不存在，"
+                "[FriendBirthday] 配置中暂无好友生日数据，"
                 "将在收到第一个 AIOCQHTTP 事件时自动获取。"
             )
         else:
@@ -67,66 +76,99 @@ class FriendBirthdayPlugin(Star):
 
     @filter.platform_adapter_type(PlatformAdapterType.AIOCQHTTP)
     async def _auto_fetch_trigger(self, event: AiocqhttpMessageEvent):
-        """收到任意 AIOCQHTTP 事件时，若数据文件不存在则触发一次自动获取。"""
+        """收到任意 AIOCQHTTP 事件时，若配置中无生日数据则触发一次自动获取。"""
         if self._need_initial_fetch and not self._fetching:
-            self._need_initial_fetch = False
+            # 注意：_need_initial_fetch 不在此处置 False，
+            # 只有拉取成功后才置 False，失败时保留自动重试能力
             self._fetching = True
-            asyncio.create_task(self.fetch_friends_birthday(event.bot))
+            self._spawn_task(self.fetch_friends_birthday(event.bot))
+
+    # ------------------------------------------------------------------
+    # 后台任务托管
+    # ------------------------------------------------------------------
+
+    def _spawn_task(self, coro) -> asyncio.Task:
+        """创建后台任务并托管到 _bg_tasks，任务结束后自动从集合中移除。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     # ------------------------------------------------------------------
     # 核心：获取好友列表及生日信息
     # ------------------------------------------------------------------
 
+    async def _fetch_one_birthday(
+        self, bot, friend: dict, sem: asyncio.Semaphore
+    ) -> dict | None:
+        """受限并发地获取单个好友的生日信息，内置请求间隔和自动重试。"""
+        qq = str(friend.get("user_id", ""))
+        if not qq:
+            return None
+        nickname = friend.get("remark") or friend.get("nickname") or qq
+        bday_year = bday_month = bday_day = None
+
+        async with sem:
+            for attempt in range(1 + len(_FETCH_RETRY_WAITS)):
+                try:
+                    info: dict = await bot.get_stranger_info(user_id=int(qq), no_cache=True)
+                    bday_year = info.get("birthday_year")
+                    bday_month = info.get("birthday_month")
+                    bday_day = info.get("birthday_day")
+                    break  # 成功，跳出重试循环
+                except Exception as e:
+                    if attempt < len(_FETCH_RETRY_WAITS):
+                        wait = _FETCH_RETRY_WAITS[attempt]
+                        logger.warning(
+                            f"[FriendBirthday] 获取 {nickname}({qq}) 失败"
+                            f"（第 {attempt + 1} 次），等待 {wait:.0f}s 后重试: {e}"
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        logger.warning(
+                            f"[FriendBirthday] 获取 {nickname}({qq}) 生日失败"
+                            f"（已重试 {len(_FETCH_RETRY_WAITS)} 次，放弃）: {e}"
+                        )
+            # 每条请求完成后等待最小间隔，降低服务端负荷
+            await asyncio.sleep(_FETCH_DELAY)
+
+        return {
+            "qq": qq,
+            "nickname": nickname,
+            "birthday_year": bday_year,
+            "birthday_month": bday_month,
+            "birthday_day": bday_day,
+        }
+
     async def fetch_friends_birthday(self, bot) -> None:
-        """通过 OneBot API 获取所有好友的生日信息并写入 JSON 文件。"""
+        """通过 OneBot API 并发获取所有好友的生日信息并写入 JSON 文件。"""
         async with self._fetch_lock:
             try:
                 logger.info("[FriendBirthday] 开始获取好友列表...")
                 friend_list: list[dict] = await bot.get_friend_list()
                 logger.info(
                     f"[FriendBirthday] 共 {len(friend_list)} 位好友，"
-                    "开始逐一获取生日信息（可能需要较长时间）..."
+                    f"开始并发获取生日信息（并发度 {_FETCH_CONCURRENCY}）..."
                 )
 
-                friends_data: list[dict] = []
-                for friend in friend_list:
-                    qq = str(friend.get("user_id", ""))
-                    nickname = (
-                        friend.get("remark")
-                        or friend.get("nickname")
-                        or qq
-                    )
-                    if not qq:
-                        continue
-                    try:
-                        info: dict = await bot.get_stranger_info(
-                            user_id=int(qq), no_cache=True
-                        )
-                        bday_year = info.get("birthday_year")
-                        bday_month = info.get("birthday_month")
-                        bday_day = info.get("birthday_day")
-                    except Exception as e:
-                        logger.warning(
-                            f"[FriendBirthday] 获取 {nickname}({qq}) 生日失败: {e}"
-                        )
-                        bday_year = bday_month = bday_day = None
-
-                    friends_data.append(
-                        {
-                            "qq": qq,
-                            "nickname": nickname,
-                            "birthday_year": bday_year,
-                            "birthday_month": bday_month,
-                            "birthday_day": bday_day,
-                        }
-                    )
+                sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+                raw_results = await asyncio.gather(
+                    *[self._fetch_one_birthday(bot, f, sem) for f in friend_list],
+                    return_exceptions=True,
+                )
+                friends_data: list[dict] = [
+                    r for r in raw_results
+                    if isinstance(r, dict) and r is not None
+                ]
 
                 self._save_data(friends_data)
+                # 仅在成功保存后置 False，失败时保留自动重试能力
+                self._need_initial_fetch = False
                 valid = sum(
                     1 for f in friends_data if f.get("birthday_month") and f.get("birthday_day")
                 )
                 logger.info(
-                    f"[FriendBirthday] 好友生日数据已保存至插件配置，"
+                    f"[FriendBirthday] 好友生日数据已保存，"
                     f"共 {len(friends_data)} 位好友，其中 {valid} 位有生日信息。"
                 )
             except (OSError, ConnectionError, TimeoutError) as e:
@@ -157,6 +199,12 @@ class FriendBirthdayPlugin(Star):
             p for p in active_insts.values() if p.status == PlatformStatus.RUNNING
         ]
         if running:
+            if len(running) > 1:
+                logger.warning(
+                    f"[FriendBirthday] 检测到 {len(running)} 个运行中的平台实例，"
+                    f"将使用首个实例（{running[0].meta().id}）发送消息。"
+                    "多平台场景下建议在配置中通过完整 SID 精确指定目标。"
+                )
             return f"{running[0].meta().id}:{msg_type}:{target_id}"
 
         # 保底：取第一个已知平台或 default
@@ -236,16 +284,23 @@ class FriendBirthdayPlugin(Star):
     # 发送提醒
     # ------------------------------------------------------------------
 
-    async def _send_reminder(self, friends: list[dict], days_ahead: int) -> None:
-        """向所有配置的目标（私聊 + 群聊）发送生日提醒。"""
+    async def _send_reminder(
+        self, friends: list[dict], days_ahead: int
+    ) -> tuple[int, int]:
+        """向所有配置的目标（私聊 + 群聊）发送生日提醒。
+
+        Returns:
+            (sent, failed): 实际投递成功条数与失败条数。
+        """
         all_targets = [
             (uid, "FriendMessage") for uid in self.notify_private_ids
         ] + [
             (gid, "GroupMessage") for gid in self.notify_group_ids
         ]
         if not friends or not all_targets:
-            return
+            return 0, 0
 
+        sent, failed = 0, 0
         for friend in friends:
             name = friend.get("nickname") or friend.get("qq")
             qq = friend.get("qq")
@@ -280,10 +335,13 @@ class FriendBirthdayPlugin(Star):
                     logger.info(
                         f"[FriendBirthday] 已向 {session_id} 发送提醒: {name}（{qq}）"
                     )
+                    sent += 1
                 except Exception as e:
                     logger.error(
                         f"[FriendBirthday] 向 {session_id} 发送提醒失败: {e}"
                     )
+                    failed += 1
+        return sent, failed
 
     # ------------------------------------------------------------------
     # 每日定时任务
@@ -323,18 +381,29 @@ class FriendBirthdayPlugin(Star):
                 logger.error(f"[FriendBirthday] 每日任务出错: {e}")
                 await asyncio.sleep(300)
 
-    async def _run_birthday_check(self) -> None:
-        """执行一次完整的生日检查（当天 + 提前 N 天）并发送提醒。"""
+    async def _run_birthday_check(self) -> tuple[int, int]:
+        """执行一次完整的生日检查（当天 + 提前 N 天）并发送提醒。
+
+        Returns:
+            (sent, failed): 本次检查累计投递成功与失败条数。
+        """
         today_list = self._today_birthdays()
         advance_list = self._advance_birthdays()
 
+        total_sent, total_failed = 0, 0
         if today_list:
-            await self._send_reminder(today_list, 0)
+            s, f = await self._send_reminder(today_list, 0)
+            total_sent += s
+            total_failed += f
         if advance_list:
-            await self._send_reminder(advance_list, self.advance_days)
+            s, f = await self._send_reminder(advance_list, self.advance_days)
+            total_sent += s
+            total_failed += f
 
         if not today_list and not advance_list:
             logger.debug("[FriendBirthday] 今日检查完成，无生日提醒。")
+
+        return total_sent, total_failed
 
     # ------------------------------------------------------------------
     # 指令
@@ -356,7 +425,7 @@ class FriendBirthdayPlugin(Star):
             return
 
         self._fetching = True
-        asyncio.create_task(self.fetch_friends_birthday(bot))
+        self._spawn_task(self.fetch_friends_birthday(bot))
         yield event.plain_result(
             "🔄 已在后台开始刷新好友生日数据，完成后将自动写入插件配置。\n"
             f"可在 AstrBot 配置面板 → 插件配置 → 本插件 → friends_birthday 中查看和编辑。"
@@ -409,12 +478,12 @@ class FriendBirthdayPlugin(Star):
             )
             return
 
-        await self._run_birthday_check()
-        total = len(today_list) + len(advance_list)
-        total_targets = len(self.notify_private_ids) + len(self.notify_group_ids)
-        yield event.plain_result(
-            f"✅ 检查完成，已发送 {total} 条生日提醒至 {total_targets} 个目标。"
-        )
+        sent, failed = await self._run_birthday_check()
+        result_msg = f"✅ 检查完成，共投递 {sent} 条生日提醒"
+        if failed:
+            result_msg += f"，{failed} 条发送失败（详见日志）"
+        result_msg += "。"
+        yield event.plain_result(result_msg)
 
     @filter.command("生日状态")
     async def cmd_status(self, event: AstrMessageEvent):
@@ -442,10 +511,21 @@ class FriendBirthdayPlugin(Star):
         yield event.plain_result(status)
 
     async def terminate(self):
-        """插件卸载时取消后台任务。"""
+        """插件卸载时取消所有后台任务。"""
+        # 取消每日定时任务
         if self._daily_task is not None:
             self._daily_task.cancel()
             try:
                 await self._daily_task
             except asyncio.CancelledError:
                 pass
+
+        # 取消所有托管的后台抓取任务
+        for task in list(self._bg_tasks):
+            task.cancel()
+        for task in list(self._bg_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._bg_tasks.clear()
