@@ -89,10 +89,18 @@ class FriendBirthdayPlugin(Star):
                 file_data = await asyncio.to_thread(json.loads, content)
                 saved: list = file_data.get("friends_birthday", [])
                 if saved:
-                    self.config["friends_birthday"] = saved
+                    deduped, removed = self._deduplicate_data(saved)
+                    if removed:
+                        logger.warning(
+                            f"[FriendBirthday] 检测到 {removed} 条重复 QQ 记录，"
+                            "已自动去重并将回写文件。"
+                        )
+                        await self._save_data(deduped)
+                    else:
+                        self.config["friends_birthday"] = deduped
                     self._need_initial_fetch = False
                     logger.info(
-                        f"[FriendBirthday] 从 JSON 文件回灌 {len(saved)} 条生日数据至配置。"
+                        f"[FriendBirthday] 从 JSON 文件回灌 {len(deduped)} 条生日数据至配置。"
                     )
             except (OSError, json.JSONDecodeError) as e:
                 logger.warning(f"[FriendBirthday] 读取 JSON 文件失败，将重新拉取: {e}")
@@ -104,6 +112,13 @@ class FriendBirthdayPlugin(Star):
             )
         else:
             data = self._load_data()
+            # 若原始配置中存在字符串形式的条目（AstrBot UI 粘贴导入的副作用），
+            # 则将解析还原后的结果回写，修正文件格式，避免每次重启都触发解析警告
+            raw_entries: list = list(self.config.get("friends_birthday", []))
+            has_str_entries = any(isinstance(e, str) for e in raw_entries)
+            if has_str_entries:
+                logger.info("[FriendBirthday] 检测到字符串条目，正在自动修正并回写文件...")
+                await self._save_data(data)
             valid = sum(
                 1 for f in data if f.get("birthday_month") and f.get("birthday_day")
             )
@@ -273,12 +288,67 @@ class FriendBirthdayPlugin(Star):
     # 数据读写
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _deduplicate_data(data: list[dict]) -> tuple[list[dict], int]:
+        """按 qq 字段对好友列表去重，保留每个 QQ 号最后一条记录。
+
+        Returns:
+            (deduped, removed_count): 去重后的列表及被移除的重复条目数量。
+        """
+        seen: dict[str, dict] = {}
+        for entry in data:
+            qq = str(entry.get("qq", "")).strip()
+            if qq:
+                seen[qq] = entry  # 后出现的覆盖前面的，保留最新值
+        deduped = list(seen.values())
+        return deduped, len(data) - len(deduped)
+
     def _load_data(self) -> list[dict]:
-        """从插件配置中读取好友生日列表。"""
-        return list(self.config.get("friends_birthday", []))
+        """从插件配置中读取好友生日列表。
+
+        兼容 AstrBot 配置 UI 粘贴导入时将对象序列化为字符串的情况：
+        若列表元素为 str，则尝试 json.loads 还原为 dict；解析失败的条目记警告后跳过。
+        """
+        raw: list = list(self.config.get("friends_birthday", []))
+        result: list[dict] = []
+        str_count = 0
+        for entry in raw:
+            if isinstance(entry, dict):
+                result.append(entry)
+            elif isinstance(entry, str):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    parsed = json.loads(entry)
+                    if isinstance(parsed, dict):
+                        result.append(parsed)
+                        str_count += 1
+                    else:
+                        logger.warning(
+                            f"[FriendBirthday] 跳过无法解析为对象的生日条目（解析结果非 dict）: {entry!r}"
+                        )
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"[FriendBirthday] 跳过无法解析为 JSON 的生日条目: {entry!r}"
+                    )
+            else:
+                logger.warning(
+                    f"[FriendBirthday] 跳过类型异常的生日条目（{type(entry).__name__}）: {entry!r}"
+                )
+        if str_count:
+            logger.info(
+                f"[FriendBirthday] 检测到 {str_count} 条字符串形式的生日条目，"
+                "已自动解析为对象，建议通过保存操作将数据格式修正至文件。"
+            )
+        return result
 
     async def _save_data(self, data: list[dict]) -> None:
         """将好友生日列表异步写回插件配置并持久化到磁盘（带锁，防并发写冲突）。"""
+        # 写入前去重，兜底防止手动批量编辑时引入重复 QQ
+        data, removed = self._deduplicate_data(data)
+        if removed:
+            logger.info(f"[FriendBirthday] 保存时发现并移除 {removed} 条重复 QQ 记录。")
         async with self._data_lock:
             # 先持久化到磁盘，成功后再更新内存，避免不一致
             try:
