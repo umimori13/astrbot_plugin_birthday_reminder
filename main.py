@@ -108,29 +108,38 @@ class FriendBirthdayPlugin(Star):
         nickname = friend.get("remark") or friend.get("nickname") or qq
         bday_year = bday_month = bday_day = None
 
-        async with sem:
-            for attempt in range(1 + len(_FETCH_RETRY_WAITS)):
+        for attempt in range(1 + len(_FETCH_RETRY_WAITS)):
+            last_exc: Exception | None = None
+
+            # 信号量仅包裹实际网络请求 + 节流间隔，绝不在此持锁等待重试
+            async with sem:
                 try:
                     info: dict = await bot.get_stranger_info(user_id=int(qq), no_cache=True)
                     bday_year = info.get("birthday_year")
                     bday_month = info.get("birthday_month")
                     bday_day = info.get("birthday_day")
-                    break  # 成功，跳出重试循环
                 except Exception as e:
-                    if attempt < len(_FETCH_RETRY_WAITS):
-                        wait = _FETCH_RETRY_WAITS[attempt]
-                        logger.warning(
-                            f"[FriendBirthday] 获取 {nickname}({qq}) 失败"
-                            f"（第 {attempt + 1} 次），等待 {wait:.0f}s 后重试: {e}"
-                        )
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.warning(
-                            f"[FriendBirthday] 获取 {nickname}({qq}) 生日失败"
-                            f"（已重试 {len(_FETCH_RETRY_WAITS)} 次，放弃）: {e}"
-                        )
-            # 每条请求完成后等待最小间隔，降低服务端负荷
-            await asyncio.sleep(_FETCH_DELAY)
+                    last_exc = e
+                finally:
+                    # 无论成功/失败，释放信号量前先等节流间隔
+                    await asyncio.sleep(_FETCH_DELAY)
+
+            if last_exc is None:
+                break  # 请求成功，退出重试循环
+
+            # ---- 以下代码在信号量外执行，不占用并发槽 ----
+            if attempt < len(_FETCH_RETRY_WAITS):
+                wait = _FETCH_RETRY_WAITS[attempt]
+                logger.warning(
+                    f"[FriendBirthday] 获取 {nickname}({qq}) 失败"
+                    f"（第 {attempt + 1} 次），等待 {wait:.0f}s 后重试: {last_exc}"
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.warning(
+                    f"[FriendBirthday] 获取 {nickname}({qq}) 生日失败"
+                    f"（已重试 {len(_FETCH_RETRY_WAITS)} 次，放弃）: {last_exc}"
+                )
 
         return {
             "qq": qq,
