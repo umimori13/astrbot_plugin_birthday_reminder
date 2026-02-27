@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import json
-import os
 
 import croniter
 from astrbot.api import AstrBotConfig, logger
@@ -40,9 +39,7 @@ class FriendBirthdayPlugin(Star):
         self._fetch_lock = asyncio.Lock()
         self._need_initial_fetch: bool = len(self.config.get("friends_birthday", [])) == 0
         self._fetching: bool = False
-
-        # 启动每日定时任务
-        self._daily_task = asyncio.create_task(self.daily_task())
+        self._daily_task: asyncio.Task | None = None
 
     async def initialize(self):
         if self._need_initial_fetch:
@@ -59,6 +56,9 @@ class FriendBirthdayPlugin(Star):
                 f"[FriendBirthday] 已加载好友生日数据：{len(data)} 位好友，"
                 f"其中 {valid} 位有生日信息。"
             )
+
+        # 在 initialize 中启动定时任务，确保初始化完成后再运行
+        self._daily_task = asyncio.create_task(self.daily_task())
 
     # ------------------------------------------------------------------
     # 首次事件触发 —— 当数据文件不存在时，利用第一个收到的 AIOCQHTTP 事件
@@ -129,8 +129,10 @@ class FriendBirthdayPlugin(Star):
                     f"[FriendBirthday] 好友生日数据已保存至插件配置，"
                     f"共 {len(friends_data)} 位好友，其中 {valid} 位有生日信息。"
                 )
+            except (OSError, ConnectionError, TimeoutError) as e:
+                logger.error(f"[FriendBirthday] 获取好友生日数据失败（网络/IO）: {e}")
             except Exception as e:
-                logger.error(f"[FriendBirthday] 获取好友生日数据失败: {e}")
+                logger.error(f"[FriendBirthday] 获取好友生日数据时发生意外错误: {e}", exc_info=True)
             finally:
                 self._fetching = False
 
@@ -171,12 +173,10 @@ class FriendBirthdayPlugin(Star):
 
     def _save_data(self, data: list[dict]) -> None:
         """将好友生日列表写回插件配置并持久化到磁盘。"""
-        # 更新内存中的配置
-        self.config["friends_birthday"] = data
-        # 持久化到 AstrBot 插件配置文件
+        # 先持久化到磁盘，成功后再更新内存，避免不一致
         try:
             existing: dict = {}
-            if os.path.exists(self._config_file):
+            if self._config_file.exists():
                 try:
                     with open(self._config_file, "r", encoding="utf-8") as f:
                         existing = json.load(f)
@@ -188,15 +188,29 @@ class FriendBirthdayPlugin(Star):
                 json.dump(existing, f, ensure_ascii=False, indent=4)
         except OSError as e:
             logger.error(f"[FriendBirthday] 写入配置文件失败: {e}")
+            return
+        # 磁盘写入成功，更新内存中的配置
+        self.config["friends_birthday"] = data
 
     # ------------------------------------------------------------------
     # 生日查询逻辑
     # ------------------------------------------------------------------
 
-    def _birthdays_on(self, target_date: datetime.date) -> list[dict]:
-        """返回在指定日期（忽略年份）生日的好友列表。"""
+    def _birthdays_on(
+        self,
+        target_date: datetime.date,
+        data: list[dict] | None = None,
+    ) -> list[dict]:
+        """返回在指定日期（忽略年份）生日的好友列表。
+
+        Args:
+            target_date: 要匹配的日期（仅看月/日）。
+            data: 可选的好友数据列表，传入可避免重复调用 _load_data。
+        """
+        if data is None:
+            data = self._load_data()
         result = []
-        for friend in self._load_data():
+        for friend in data:
             month = friend.get("birthday_month")
             day = friend.get("birthday_day")
             if not month or not day:
@@ -208,15 +222,15 @@ class FriendBirthdayPlugin(Star):
                 continue
         return result
 
-    def _today_birthdays(self) -> list[dict]:
-        return self._birthdays_on(datetime.date.today())
+    def _today_birthdays(self, data: list[dict] | None = None) -> list[dict]:
+        return self._birthdays_on(datetime.date.today(), data=data)
 
-    def _advance_birthdays(self) -> list[dict]:
+    def _advance_birthdays(self, data: list[dict] | None = None) -> list[dict]:
         """返回 advance_days 天后生日的好友列表。"""
         if self.advance_days <= 0:
             return []
         target = datetime.date.today() + datetime.timedelta(days=self.advance_days)
-        return self._birthdays_on(target)
+        return self._birthdays_on(target, data=data)
 
     # ------------------------------------------------------------------
     # 发送提醒
@@ -237,11 +251,14 @@ class FriendBirthdayPlugin(Star):
             qq = friend.get("qq")
             bday_month = friend.get("birthday_month")
             bday_day = friend.get("birthday_day")
-            date_str = (
-                f"{int(bday_month):02d}月{int(bday_day):02d}日"
-                if bday_month and bday_day
-                else "未知日期"
-            )
+            try:
+                date_str = (
+                    f"{int(bday_month):02d}月{int(bday_day):02d}日"
+                    if bday_month and bday_day
+                    else "未知日期"
+                )
+            except (ValueError, TypeError):
+                date_str = "未知日期"
 
             if days_ahead == 0:
                 text = (
@@ -276,6 +293,8 @@ class FriendBirthdayPlugin(Star):
         """每天在配置的时间检查生日并发送提醒。"""
         try:
             hour, minute = map(int, self.check_time.split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError(f"时间超出范围: {hour}:{minute}")
         except ValueError:
             logger.error(
                 f"[FriendBirthday] check_time 格式错误 '{self.check_time}'，使用默认 8:00"
@@ -356,15 +375,18 @@ class FriendBirthdayPlugin(Star):
         today = datetime.date.today()
         lines: list[str] = []
 
+        # 一次加载，复用数据
+        cached_data = data
+
         # 今天生日
-        today_list = self._today_birthdays()
+        today_list = self._birthdays_on(today, data=cached_data)
         for f in today_list:
             lines.append(f"🎂 今天：{f.get('nickname')}（{f.get('qq')}）")
 
         # 未来 7 天
         for days in range(1, 8):
             target = today + datetime.timedelta(days=days)
-            for f in self._birthdays_on(target):
+            for f in self._birthdays_on(target, data=cached_data):
                 lines.append(
                     f"📅 {target.strftime('%m/%d')}（{days}天后）："
                     f"{f.get('nickname')}（{f.get('qq')}）"
@@ -421,8 +443,9 @@ class FriendBirthdayPlugin(Star):
 
     async def terminate(self):
         """插件卸载时取消后台任务。"""
-        self._daily_task.cancel()
-        try:
-            await self._daily_task
-        except asyncio.CancelledError:
-            pass
+        if self._daily_task is not None:
+            self._daily_task.cancel()
+            try:
+                await self._daily_task
+            except asyncio.CancelledError:
+                pass
