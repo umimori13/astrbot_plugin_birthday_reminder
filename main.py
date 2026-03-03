@@ -12,8 +12,9 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.platform import PlatformStatus
-from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import \
-    AiocqhttpMessageEvent
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
 from astrbot.core.star.filter.platform_adapter_type import PlatformAdapterType
 
 # 并发拉取参数：同时进行的最大请求数
@@ -251,37 +252,54 @@ class FriendBirthdayPlugin(Star):
     # 平台 SID 解析
     # ------------------------------------------------------------------
 
-    def _resolve_full_umo(self, target_id: str, msg_type: str) -> str:
+    def _resolve_full_umo(self, target_id: str, msg_type: str) -> str | None:
         """
         动态推算完整的 UMO (Unified Message Origin)。
         仅在 AIOCQHTTP 平台实例中选取，避免多平台场景下误发到其他平台。
+
+        Returns:
+            完整的 session_id 字符串；若找不到任何可用的 AIOCQHTTP 实例则返回 None。
         """
-        # 仅选取 AIOCQHTTP 实例，防止多平台环境下消息误投其他账号/租户
+        all_insts = self.context.platform_manager.get_insts()
+        # 打印所有实例信息，便于诊断
+        all_ids = [(p.meta().id, p.meta().name) for p in all_insts if p.meta().id]
+        logger.info(f"[FriendBirthday] 当前所有平台实例 (id, name): {all_ids}")
+
+        # 用 meta().name 判断适配器类型（name 是平台类型如 "aiocqhttp"，
+        # id 是用户自定义的实例名，不可靠）
         cqhttp_insts = [
-            p for p in self.context.platform_manager.get_insts()
-            if p.meta().id
-            and "aiocqhttp" in p.meta().id.lower()
-            and "webchat" not in p.meta().id.lower()
+            p for p in all_insts
+            if p.meta().name == "aiocqhttp"
         ]
+
+        if not cqhttp_insts:
+            logger.error(
+                "[FriendBirthday] 未找到任何 aiocqhttp 类型的平台实例，无法构造 session_id。\n"
+                f"当前全部平台实例 (id, name): {all_ids}"
+            )
+            return None
 
         running = [p for p in cqhttp_insts if p.status == PlatformStatus.RUNNING]
         if running:
             if len(running) > 1:
                 logger.warning(
-                    f"[FriendBirthday] 检测到 {len(running)} 个运行中的 AIOCQHTTP 实例，"
-                    f"将使用首个实例（{running[0].meta().id}）发送消息。"
+                    f"[FriendBirthday] 检测到 {len(running)} 个运行中的 aiocqhttp 实例，"
+                    f"将使用首个实例（id={running[0].meta().id}）发送消息。"
                     "多实例场景下建议在配置中通过完整 SID 精确指定目标。"
                 )
             return f"{running[0].meta().id}:{msg_type}:{target_id}"
 
-        # 保底：取第一个已知 AIOCQHTTP 实例或 default
-        fallback = cqhttp_insts[0].meta().id if cqhttp_insts else "default"
-        return f"{fallback}:{msg_type}:{target_id}"
+        # 有实例但均未运行（平台可能正在重连）
+        logger.warning(
+            f"[FriendBirthday] 当前无运行中的 aiocqhttp 实例，"
+            f"将尝试使用首个已知实例（id={cqhttp_insts[0].meta().id}，状态: {cqhttp_insts[0].status}）。"
+        )
+        return f"{cqhttp_insts[0].meta().id}:{msg_type}:{target_id}"
 
     def _is_admin(self, event: AstrMessageEvent) -> bool:
         """检查发送者是否在 AstrBot 管理员列表中。"""
         sender_id = str(event.get_sender_id())
-        admin_ids = [str(x) for x in self.context.config.get("admins_id", [])]
+        admin_ids = [str(x) for x in self.context.get_config().get("admins_id", [])]
         return sender_id in admin_ids
 
     # ------------------------------------------------------------------
@@ -413,22 +431,39 @@ class FriendBirthdayPlugin(Star):
         return self._birthdays_on(self._today(), data=data)
 
     def _advance_birthdays(self, data: list[dict] | None = None) -> list[dict]:
-        """返回 advance_days 天后生日的好友列表。"""
+        """返回恰好 advance_days 天后生日的好友列表（用于每日定时提醒）。"""
         if self.advance_days <= 0:
             return []
         target = self._today() + datetime.timedelta(days=self.advance_days)
         return self._birthdays_on(target, data=data)
 
+    def _upcoming_birthdays(
+        self, days: int, data: list[dict] | None = None
+    ) -> dict[int, list[dict]]:
+        """返回未来 1..days 天内（不含今天）每天生日的好友字典。
+
+        用于手动检查命令，提供比单点检查更全面的范围视图。
+
+        Returns:
+            {offset_days: [friends]} 的字典，仅含有生日好友的天数。
+        """
+        if data is None:
+            data = self._load_data()
+        today = self._today()
+        result: dict[int, list[dict]] = {}
+        for offset in range(1, days + 1):
+            target = today + datetime.timedelta(days=offset)
+            friends = self._birthdays_on(target, data=data)
+            if friends:
+                result[offset] = friends
+        return result
+
     # ------------------------------------------------------------------
     # 发送提醒
     # ------------------------------------------------------------------
 
-    async def _send_reminder(
-        self, friends: list[dict], days_ahead: int
-    ) -> tuple[int, int]:
-        """向所有配置的目标（私聊 + 群聊）发送聚合生日提醒。
-
-        所有好友合并为单条消息发送，避免好友数量多时造成消息洪泛。
+    async def _send_to_targets(self, text: str) -> tuple[int, int]:
+        """向所有配置的目标（私聊 + 群聊）发送一条消息。
 
         Returns:
             (sent, failed): 实际投递成功条数与失败条数（按目标数计）。
@@ -438,28 +473,18 @@ class FriendBirthdayPlugin(Star):
         ] + [
             (gid, "GroupMessage") for gid in self.notify_group_ids
         ]
-        if not friends or not all_targets:
+        if not all_targets:
             return 0, 0
-
-        # 聚合所有好友信息为单条消息，每个目标只收到一条提醒
-        friend_lines = [
-            f"• {f.get('nickname') or f.get('qq')}（QQ: {f.get('qq')}）"
-            for f in friends
-        ]
-        if days_ahead == 0:
-            text = "🎂 今日好友生日提醒\n" + "\n".join(friend_lines) + "\n\n记得送上祝福哦！🎉"
-        else:
-            advance_date = self._today() + datetime.timedelta(days=days_ahead)
-            date_str = advance_date.strftime("%m月%d日")
-            text = (
-                f"🔔 生日提醒：以下好友将在 {days_ahead} 天后（{date_str}）过生日\n"
-                + "\n".join(friend_lines)
-                + "\n\n别忘了送上祝福！"
-            )
 
         sent, failed = 0, 0
         for raw_id, msg_type in all_targets:
             session_id = self._resolve_full_umo(raw_id, msg_type)
+            if session_id is None:
+                logger.error(
+                    f"[FriendBirthday] 无法为 {raw_id}({msg_type}) 构造 session_id，跳过发送。"
+                )
+                failed += 1
+                continue
             # 发送前验证平台是否仍在运行，防止平台断连时引发异常
             parts = session_id.split(":", 2)
             if len(parts) == 3:
@@ -479,10 +504,7 @@ class FriendBirthdayPlugin(Star):
             try:
                 chain = MessageChain().message(text)
                 await self.context.send_message(session_id, chain)
-                logger.info(
-                    f"[FriendBirthday] 已向 {session_id} 发送提醒"
-                    f"（{len(friends)} 位好友，{'今日' if days_ahead == 0 else f'{days_ahead}天后'}）"
-                )
+                logger.info(f"[FriendBirthday] 已向 {session_id} 发送生日提醒")
                 sent += 1
             except Exception as e:
                 logger.error(f"[FriendBirthday] 向 {session_id} 发送提醒失败: {e}")
@@ -532,27 +554,58 @@ class FriendBirthdayPlugin(Star):
                 _now = datetime.datetime.now(self._timezone) if self._timezone else datetime.datetime.now()
                 cron = croniter.croniter(cron_expr, _now)
 
-    async def _run_birthday_check(self) -> tuple[int, int]:
-        """执行一次完整的生日检查（当天 + 提前 N 天）并发送提醒。
+    async def _run_birthday_check(
+        self,
+        data: list[dict] | None = None,
+    ) -> tuple[int, int]:
+        """执行一次完整的生日检查（今天 + 未来 1..advance_days 天）并发送提醒。
 
+        每天均扫描完整范围，确保所有即将生日的好友都能每天收到提醒。
+
+        Args:
+            data: 可选的好友数据列表，传入可避免重复调用 _load_data。
         Returns:
             (sent, failed): 本次检查累计投递成功与失败条数。
         """
-        today_list = self._today_birthdays()
-        advance_list = self._advance_birthdays()
+        if data is None:
+            data = self._load_data()
+
+        today_list = self._today_birthdays(data=data)
+        upcoming = (
+            self._upcoming_birthdays(self.advance_days, data=data)
+            if self.advance_days > 0
+            else {}
+        )
+        upcoming_count = sum(len(v) for v in upcoming.values())
+
+        logger.info(
+            f"[FriendBirthday] 开始生日检查（今日: {len(today_list)} 人，"
+            f"未来 {self.advance_days} 天内: {upcoming_count} 人）"
+        )
 
         total_sent, total_failed = 0, 0
-        if today_list:
-            s, f = await self._send_reminder(today_list, 0)
-            total_sent += s
-            total_failed += f
-        if advance_list:
-            s, f = await self._send_reminder(advance_list, self.advance_days)
-            total_sent += s
-            total_failed += f
-
-        if not today_list and not advance_list:
-            logger.debug("[FriendBirthday] 今日检查完成，无生日提醒。")
+        if today_list or upcoming:
+            # 把所有区段拼成一条消息，一次性发送
+            sections: list[str] = []
+            if today_list:
+                lines = [
+                    f"• {f.get('nickname') or f.get('qq')}（QQ: {f.get('qq')}）"
+                    for f in today_list
+                ]
+                sections.append("🎂 今日生日\n" + "\n".join(lines))
+            for offset in sorted(upcoming):
+                friends = upcoming[offset]
+                target_date = self._today() + datetime.timedelta(days=offset)
+                date_str = target_date.strftime("%m月%d日")
+                lines = [
+                    f"• {f.get('nickname') or f.get('qq')}（QQ: {f.get('qq')}）"
+                    for f in friends
+                ]
+                sections.append(f"📅 {offset}天后（{date_str}）\n" + "\n".join(lines))
+            text = "🔔 好友生日提醒\n\n" + "\n\n".join(sections) + "\n\n别忘了送上祝福！🎉"
+            total_sent, total_failed = await self._send_to_targets(text)
+        else:
+            logger.info("[FriendBirthday] 今日检查完成，无生日提醒。")
 
         return total_sent, total_failed
 
@@ -639,16 +692,39 @@ class FriendBirthdayPlugin(Star):
             return
 
         self._last_cmd_time = now
-        today_list = self._today_birthdays()
-        advance_list = self._advance_birthdays()
+        data = self._load_data()
+        today_list = self._today_birthdays(data=data)
+        upcoming: dict[int, list[dict]] = (
+            self._upcoming_birthdays(self.advance_days, data=data)
+            if self.advance_days > 0
+            else {}
+        )
 
-        if not today_list and not advance_list:
-            yield event.plain_result(
-                f"✅ 检查完成：今天及 {self.advance_days} 天后均无好友生日。"
+        if not today_list and not upcoming:
+            range_desc = (
+                f"今天及未来 {self.advance_days} 天内"
+                if self.advance_days > 0
+                else "今天"
             )
+            yield event.plain_result(f"✅ 检查完成：{range_desc}均无好友生日。")
             return
-        sent, failed = await self._run_birthday_check()
-        result_msg = f"✅ 检查完成，共投递 {sent} 条生日提醒"
+
+        # 先展示本次检查发现的汇总信息
+        summary_lines: list[str] = []
+        if today_list:
+            names = "、".join(f.get('nickname') or f.get('qq') for f in today_list)
+            summary_lines.append(f"🎂 今天生日：{names}")
+        for offset in sorted(upcoming):
+            friends = upcoming[offset]
+            target = self._today() + datetime.timedelta(days=offset)
+            date_str = target.strftime("%m月%d日")
+            names = "、".join(f.get('nickname') or f.get('qq') for f in friends)
+            summary_lines.append(f"📅 {date_str}（{offset}天后）：{names}")
+        yield event.plain_result("🔍 检查结果：\n" + "\n".join(summary_lines))
+
+        # 复用 _run_birthday_check 发送提醒（传入已加载的 data，避免重复读取）
+        sent, failed = await self._run_birthday_check(data=data)
+        result_msg = f"✅ 提醒已投递：共 {sent} 条"
         if failed:
             result_msg += f"，{failed} 条发送失败（详见日志）"
         result_msg += "。"
